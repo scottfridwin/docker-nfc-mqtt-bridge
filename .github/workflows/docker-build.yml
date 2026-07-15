@@ -4,66 +4,225 @@ on:
   push:
     branches:
       - main
-      - 'v*'   # Trigger on semantic version tags like v1.2.3
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Version tag to release (e.g., v1.0.0). Promotes the current main image. Leave empty to just build."
+        required: false
+        type: string
 
-permissions:
-  contents: read
-  packages: write
+env:
+  REGISTRY: ghcr.io
+  OWNER: ${{ github.repository_owner }}
+  IMAGE_NAME: ${{ github.event.repository.name }}
 
 jobs:
-  build:
+  test:
+    name: Test Python
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-      # 1. Checkout code
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Enable QEMU for ARM emulation
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      # 3. Enable Docker Buildx
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          fi
 
-      # 4. Login to GitHub Container Registry
+      - name: Run unit tests (if present)
+        run: |
+          if find . -type f -path '*/test*' -name 'test_*.py' -not -path '*/.venv/*' | grep -q .; then
+            echo "Running discovered Python tests"
+            python -m unittest discover -s . -p 'test_*.py' -v
+          else
+            echo "No Python tests found, skipping."
+          fi
+
+      - name: Verify Python files compile
+        run: |
+          python - << 'PY'
+          import ast
+          import pathlib
+          import sys
+
+          failures = []
+          count = 0
+          for path in pathlib.Path('.').rglob('*.py'):
+              if any(part in {'.git', '.venv', '__pycache__'} for part in path.parts):
+                  continue
+              count += 1
+              try:
+                  ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+              except SyntaxError as exc:
+                  failures.append(f"FAIL: {path}: {exc}")
+
+          for failure in failures:
+              print(failure)
+
+          if failures:
+              sys.exit(1)
+
+          print(f"All {count} Python files compile OK")
+          PY
+
+  build:
+    name: Build Image
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag == '')
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_NAME }}"
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+          TAGS="${IMAGE}:sha-${SHORT_SHA}"
+
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            TAGS="${TAGS},${IMAGE}:main"
+          fi
+
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Generated tags: ${TAGS}"
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5. Set semantic version tags
-      - name: Set image tags
-        id: tags
-        run: |
-          # Determine version tag
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG="${GITHUB_REF##*/}"          # e.g., v1.2.3
-          else
-            TAG=dev-${GITHUB_SHA::7}        # e.g., dev-6320c5f
-          fi
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-          # Short tag for minor version
-          SHORT_TAG=$(echo $TAG | cut -d. -f1,2) # e.g., v1.2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "SHORT_TAG=$SHORT_TAG" >> $GITHUB_ENV
-
-      # 6. Build and push multi-arch Docker image
-      - name: Build and push Docker image
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64,linux/arm/v8
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:${{ env.SHORT_TAG }}
-            ghcr.io/${{ github.repository }}:${{ env.TAG }}
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release:
+    name: Release ${{ github.event.inputs.release_tag }}
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Verify main branch
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Release can only be triggered from the main branch (got $GITHUB_REF)"
+            exit 1
+          fi
+
+          RELEASE_TAG="${{ github.event.inputs.release_tag }}"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release_tag must match vMAJOR.MINOR.PATCH (example: v1.0.0)"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Promote image
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_NAME }}"
+          VERSION_TAG="${{ github.event.inputs.release_tag }}"
+          VERSION_NO_V="${VERSION_TAG#v}"
+          VERSION_MAJOR=$(echo "$VERSION_NO_V" | cut -d. -f1)
+          VERSION_MINOR=$(echo "$VERSION_NO_V" | cut -d. -f1,2)
+
+          echo "Promoting ${IMAGE}:main -> ${VERSION_TAG}, ${VERSION_NO_V}, ${VERSION_MINOR}, ${VERSION_MAJOR}, latest"
+
+          crane copy "${IMAGE}:main" "${IMAGE}:${VERSION_TAG}"
+          crane copy "${IMAGE}:main" "${IMAGE}:${VERSION_NO_V}"
+          crane copy "${IMAGE}:main" "${IMAGE}:${VERSION_MINOR}"
+          crane copy "${IMAGE}:main" "${IMAGE}:${VERSION_MAJOR}"
+          crane copy "${IMAGE}:main" "${IMAGE}:latest"
+
+      - name: Create git tag
+        run: |
+          VERSION_TAG="${{ github.event.inputs.release_tag }}"
+          git tag "$VERSION_TAG" || true
+          git push origin "$VERSION_TAG" || true
+
+  release-notes:
+    name: Create GitHub Release
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        run: |
+          VERSION_TAG="${{ github.event.inputs.release_tag }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_NAME }}"
+
+          PREV_TAG=$(git tag --sort=-version:refname | grep '^v' | grep -v "^${VERSION_TAG}$" | head -1)
+          if [[ -n "$PREV_TAG" ]]; then
+            NOTES=$(git log --pretty=format:'- %s (%h)' "${PREV_TAG}..HEAD" | head -50)
+          else
+            NOTES='Initial release'
+          fi
+
+          {
+            echo "$NOTES"
+            echo
+            echo '## Docker Image'
+            echo
+            echo '```'
+            echo "docker pull ${IMAGE}:${VERSION_TAG}"
+            echo '```'
+          } > /tmp/release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          body_path: /tmp/release-notes.md
+          generate_release_notes: false
