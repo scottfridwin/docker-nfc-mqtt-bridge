@@ -17,7 +17,7 @@ on:
 env:
   REGISTRY: ghcr.io
   OWNER: ${{ github.repository_owner }}
-  IMAGE_NAME: ${{ github.event.repository.name }}
+  IMAGE_NAME: nfc-mqtt-bridge
 
 jobs:
   test:
