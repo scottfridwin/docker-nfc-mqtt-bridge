@@ -32,6 +32,7 @@ Turn a USB NFC reader into a [Home Assistant](https://www.home-assistant.io/) ta
   ```
 
 - An MQTT broker that Home Assistant uses (for example the Mosquitto add-on)
+- `pcscd` 1.9 or newer on the host (Raspberry Pi OS / Debian bullseye or later). The image uses Debian bookworm's PC/SC client, which works with both older and newer `pcscd` versions.
 
 ## Quick start
 
@@ -125,6 +126,7 @@ For other MQTT consumers (`<id>` is `DEVICE_ID`):
 | Symptom | What to check |
 | --- | --- |
 | Log repeats *Waiting for pcscd socket* | `pcscd` is not running on the host, or `/run/pcscd` is not mounted into the container. |
+| *Failed to establish context: Service was stopped (0x8010001E)* | The container's PC/SC client and the host's `pcscd` speak incompatible protocol versions. Check `dpkg -l pcscd` on the host and open an issue with the version. |
 | Connected, but tags are never detected | Run `pcsc_scan` on the host. If it sees the tag, check the container log with `LOG_LEVEL=DEBUG`. |
 | PC/SC access denied | Recent `pcscd` packages use polkit and may refuse users without a login session. Allow the container's UID for `org.debian.pcsc-lite.access_pcsc` and `org.debian.pcsc-lite.access_card` in a polkit rule. |
 | Reader shows as unavailable in Home Assistant | Check the MQTT host and credentials in the container log. |
