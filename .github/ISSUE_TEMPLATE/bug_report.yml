@@ -1,0 +1,38 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Image version
+      description: The image tag or digest you are running.
+      placeholder: ghcr.io/scottfridwin/nfc-mqtt-bridge:1.2.0
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host and reader
+      description: Host OS and architecture, and the NFC reader model.
+      placeholder: Raspberry Pi OS 64-bit (arm64), ACR122U
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Container log
+      description: Run with `LOG_LEVEL=DEBUG` if possible. Remove passwords and host names you do not want to share.
+      render: text
+  - type: textarea
+    id: pcsc
+    attributes:
+      label: Output of `pcsc_scan` on the host
+      render: text

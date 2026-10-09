@@ -27,6 +27,28 @@ env:
 
 jobs:
   # ----------------------------------------------------------
+  # Lint: ruff (pycodestyle, pyflakes, bugbear, bandit, ...) and formatting
+  # ----------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install ruff
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet -r requirements-dev.txt
+
+      - name: Lint
+        run: .venv/bin/ruff check --output-format=github .
+
+      - name: Check formatting
+        run: .venv/bin/ruff format --check .
+
+  # ----------------------------------------------------------
   # Test: run the unit tests inside the image on every platform
   # ----------------------------------------------------------
   test:
@@ -59,11 +81,13 @@ jobs:
   publish:
     name: Publish image
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: test
+    needs: [lint, test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
 
@@ -107,6 +131,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
   # ----------------------------------------------------------
   # Release check: release when a merge to main changes the image
   # ----------------------------------------------------------
@@ -133,7 +164,7 @@ jobs:
           BODY="$(git log -1 --format=%b)"
           echo "Subject: ${SUBJECT}"
           echo "Changed files:"; echo "${CHANGED}"
-          if grep -qE '^(Dockerfile|requirements\.txt|nfc_reader\.py|start\.sh)$' <<< "$CHANGED"; then
+          if grep -qE '^(Dockerfile|requirements\.txt|nfc_reader\.py|healthcheck\.py|start\.sh)$' <<< "$CHANGED"; then
             echo "release=true" >> "$GITHUB_OUTPUT"
           else
             echo "release=false" >> "$GITHUB_OUTPUT"
@@ -255,7 +286,7 @@ jobs:
   notify-failure:
     name: Notify failure
     if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, publish, release-check, release]
+    needs: [lint, test, publish, release-check, release]
     runs-on: ubuntu-latest
     permissions:
       issues: write

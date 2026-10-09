@@ -1,0 +1,10 @@
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "S", "BLE"]
+
+[tool.ruff.lint.per-file-ignores]
+# asserts, fake paths and dummy credentials are fine in tests
+"tests/*" = ["S101", "S106", "S108"]
