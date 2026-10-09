@@ -1,20 +1,22 @@
 services:
-  nfc-mqtt:
-    build: .
-    container_name: nfc-mqtt
-    volumes:
-      - /run/pcscd:/run/pcscd:ro   # Mount host pcscd socket (read-only)
+  nfc-mqtt-bridge:
+    image: ghcr.io/scottfridwin/nfc-mqtt-bridge:1
+    # build: .   # build from source instead
+    container_name: nfc-mqtt-bridge
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: homeassistant.local
+      MQTT_PORT: 1883
+      MQTT_USERNAME: nfc
+      MQTT_PASSWORD_FILE: /run/secrets/mqtt_password
+      DEVICE_ID: nfc_reader
+      DEVICE_NAME: NFC Reader
+      LOG_LEVEL: INFO
     secrets:
       - mqtt_password
-    environment:
-      MQTT_HOST: 192.168.0.123
-      MQTT_PORT: 1883
-      MQTT_USERNAME: tagreader
-      MQTT_PASSWORD_FILE: /run/secrets/mqtt_password
-      MQTT_TOPIC: homeassistant/nfc/tag
-      LOG_LEVEL: INFO
-    restart: unless-stopped
+    volumes:
+      - /run/pcscd:/run/pcscd   # the host's pcscd socket
 
 secrets:
   mqtt_password:
-    file: ./.secrets/mqtt_password.txt
+    file: ./mqtt_password.txt

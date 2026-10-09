@@ -1,4 +1,5 @@
 {
-	"name": "docker-nfc-mqtt-bridge",
-	"image": "mcr.microsoft.com/devcontainers/python:3-3.14-trixie"
+  "name": "docker-nfc-mqtt-bridge",
+  "image": "mcr.microsoft.com/devcontainers/python:3-3.14-trixie",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcsclite-dev swig && pip install -r requirements.txt"
 }

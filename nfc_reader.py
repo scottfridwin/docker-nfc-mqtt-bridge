@@ -1,198 +1,215 @@
 #!/usr/bin/env python3
-import os
-import time
+"""Read NFC tag UIDs from a PC/SC reader and publish them to MQTT for Home Assistant."""
+
 import json
 import logging
+import os
 import signal
 import threading
+from dataclasses import dataclass
+
 import paho.mqtt.client as mqtt
 from smartcard.Exceptions import CardConnectionException, NoCardException
-from smartcard.scard import SCardEstablishContext, SCARD_SCOPE_USER
-from smartcard.System import readers
 from smartcard.pcsc.PCSCExceptions import EstablishContextException
+from smartcard.System import readers as list_readers
 
-# -----------------------
-# Logging
-# -----------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("nfc")
 
+# PC/SC "Get Data" command that returns the UID on most contactless readers
+GET_UID_APDU = [0xFF, 0xCA, 0x00, 0x00, 0x00]
+POLL_INTERVAL = 0.5
+RETRY_INTERVAL = 2.0
 
-def get_env_or_file(name):
-    value = os.getenv(name)
-    file_path = os.getenv(f"{name}_FILE")
+
+def get_env_or_file(name, environ=None):
+    """Return NAME, or the contents of the file named by NAME_FILE (NAME wins)."""
+    environ = os.environ if environ is None else environ
+    value = environ.get(name)
+    file_path = environ.get(f"{name}_FILE")
 
     if value and file_path:
         log.warning("Both %s and %s_FILE are set; using %s", name, name, name)
-        return value
-
     if value:
         return value
-
     if file_path:
         try:
             with open(file_path, "r", encoding="utf-8") as secret_file:
                 return secret_file.read().strip()
         except OSError as exc:
             log.error("Unable to read %s_FILE '%s': %s", name, file_path, exc)
-
     return None
 
 
-# -----------------------
-# Environment Variables
-# -----------------------
-MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME")
-MQTT_PASSWORD = get_env_or_file("MQTT_PASSWORD")
-DEVICE_ID = os.getenv("DEVICE_ID", "nfc_reader")
-DEVICE_NAME = os.getenv("DEVICE_NAME", f"NFC Reader {DEVICE_ID}")
+@dataclass(frozen=True)
+class Config:
+    mqtt_host: str
+    mqtt_port: int
+    mqtt_username: str | None
+    mqtt_password: str | None
+    device_id: str
+    device_name: str
 
-# Home Assistant topics
-STATE_TOPIC = f"homeassistant/sensor/{DEVICE_ID}/uid/state"
-AVAILABILITY_TOPIC = f"homeassistant/sensor/{DEVICE_ID}/availability"
-DISCOVERY_TOPIC = f"homeassistant/sensor/{DEVICE_ID}/uid/config"
-TAG_EVENT_TOPIC = f"homeassistant/event/{DEVICE_ID}/tag_scanned"
+    @classmethod
+    def from_env(cls, environ=None):
+        environ = os.environ if environ is None else environ
+        device_id = environ.get("DEVICE_ID", "nfc_reader")
+        return cls(
+            mqtt_host=environ.get("MQTT_HOST", "localhost"),
+            mqtt_port=int(environ.get("MQTT_PORT", "1883")),
+            mqtt_username=environ.get("MQTT_USERNAME") or None,
+            mqtt_password=get_env_or_file("MQTT_PASSWORD", environ),
+            device_id=device_id,
+            device_name=environ.get("DEVICE_NAME", f"NFC Reader {device_id}"),
+        )
 
-# -----------------------
-# MQTT Setup
-# -----------------------
+    @property
+    def state_topic(self):
+        return f"homeassistant/sensor/{self.device_id}/uid/state"
+
+    @property
+    def availability_topic(self):
+        return f"homeassistant/sensor/{self.device_id}/availability"
+
+    @property
+    def tag_topic(self):
+        return f"homeassistant/event/{self.device_id}/tag_scanned"
 
 
-def setup_mqtt():
-    client = mqtt.Client()
-    if MQTT_USERNAME:
-        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-    client.connect(MQTT_HOST, MQTT_PORT, 60)
-    client.loop_start()
-    log.info(f"Connected to MQTT broker at {MQTT_HOST}:{MQTT_PORT}")
+def discovery_messages(config):
+    """Home Assistant MQTT discovery configs: a UID sensor and a tag scanner."""
+    device = {
+        "identifiers": [config.device_id],
+        "name": config.device_name,
+        "manufacturer": "DIY",
+        "model": "PC/SC NFC reader",
+    }
+    sensor = {
+        "name": "Tag UID",
+        "unique_id": f"{config.device_id}_uid",
+        "state_topic": config.state_topic,
+        "availability_topic": config.availability_topic,
+        "icon": "mdi:nfc",
+        "device": device,
+    }
+    tag_scanner = {
+        "topic": config.tag_topic,
+        "value_template": "{{ value_json.tag_uid }}",
+        "device": device,
+    }
+    return [
+        (f"homeassistant/sensor/{config.device_id}/uid/config", sensor),
+        (f"homeassistant/tag/{config.device_id}/config", tag_scanner),
+    ]
+
+
+def format_uid(data):
+    return "".join(f"{byte:02X}" for byte in data)
+
+
+class TagMonitor:
+    """Publishes a tag's UID when it is placed on a reader and clears it when removed."""
+
+    def __init__(self, config, publish, readers=list_readers):
+        self._config = config
+        self._publish = publish
+        self._readers = readers
+        self.last_uid = None
+
+    def poll(self):
+        for reader in self._readers():
+            connection = reader.createConnection()
+            try:
+                connection.connect()
+            except NoCardException:
+                self._tag_removed()
+                continue
+            try:
+                data, sw1, sw2 = connection.transmit(GET_UID_APDU)
+            finally:
+                connection.disconnect()
+
+            if sw1 != 0x90:
+                log.warning("Failed to read UID from tag: SW1=%02X, SW2=%02X", sw1, sw2)
+                continue
+            self._tag_present(format_uid(data))
+
+    def _tag_present(self, uid):
+        if uid == self.last_uid:
+            return
+        log.info("Tag detected: %s", uid)
+        self._publish(self._config.state_topic, uid)
+        self._publish(self._config.tag_topic, json.dumps({"tag_uid": uid}))
+        self.last_uid = uid
+
+    def _tag_removed(self):
+        if self.last_uid is None:
+            return
+        log.info("Tag removed")
+        self._publish(self._config.state_topic, "")
+        self.last_uid = None
+
+
+def create_client(config):
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.will_set(config.availability_topic, "offline", retain=True)
+    if config.mqtt_username:
+        client.username_pw_set(config.mqtt_username, config.mqtt_password)
+
+    def on_connect(client, _userdata, _flags, reason_code, _properties):
+        if reason_code.is_failure:
+            log.error("MQTT connection refused: %s", reason_code)
+            return
+        log.info("Connected to MQTT broker at %s:%s", config.mqtt_host, config.mqtt_port)
+        # Republish on every (re)connect so Home Assistant recovers after a broker restart
+        for topic, payload in discovery_messages(config):
+            client.publish(topic, json.dumps(payload), retain=True)
+        client.publish(config.availability_topic, "online", retain=True)
+
+    def on_disconnect(_client, _userdata, _flags, reason_code, _properties):
+        if reason_code.is_failure:
+            log.warning("Disconnected from MQTT broker (%s); reconnecting", reason_code)
+
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     return client
 
-# -----------------------
-# Home Assistant Discovery
-# -----------------------
 
+def main():
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    config = Config.from_env()
+    log.info("Starting NFC MQTT Bridge for %s", config.device_id)
 
-def publish_discovery(client):
-    payload = {
-        "name": DEVICE_NAME,
-        "unique_id": f"{DEVICE_ID}_uid",
-        "state_topic": STATE_TOPIC,
-        "availability_topic": AVAILABILITY_TOPIC,
-        "icon": "mdi:nfc",
-        "device": {
-            "identifiers": [DEVICE_ID],
-            "name": DEVICE_NAME,
-            "manufacturer": "DIY",
-            "model": "Raspberry Pi NFC",
-        },
-        # Enables device triggers
-        "device_class": "sensor",
-        "value_template": "{{ value }}",
-    }
-    client.publish(DISCOVERY_TOPIC, json.dumps(payload), retain=True)
-    client.publish(AVAILABILITY_TOPIC, "online", retain=True)
-    log.info("Home Assistant MQTT discovery published")
+    client = create_client(config)
+    client.connect(config.mqtt_host, config.mqtt_port, keepalive=60)
+    client.loop_start()
 
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
 
-def set_offline(client):
-    client.publish(AVAILABILITY_TOPIC, "offline", retain=True)
-
-# -----------------------
-# NFC Reader Event Loop
-# -----------------------
-
-
-def monitor_reader(client):
+    monitor = TagMonitor(config, lambda topic, payload: client.publish(topic, payload, qos=1))
     try:
-        SCardEstablishContext(SCARD_SCOPE_USER)
-    except EstablishContextException as e:
-        log.error(f"Cannot establish PC/SC context: {e}")
-        return
-
-    last_uid = None
-    while True:
-        try:
-            readers_list = readers()
-            if not readers_list:
-                time.sleep(2)
-                continue
-
-            for reader in readers_list:
-                connection = reader.createConnection()
-                try:
-                    connection.connect()
-                    card_present = True
-                except NoCardException:
-                    card_present = False
-
-                if card_present:
-                    # Send APDU to get UID (works on most NFC tags)
-                    get_uid_apdu = [0xFF, 0xCA, 0x00, 0x00, 0x00]
-                    data, sw1, sw2 = connection.transmit(get_uid_apdu)
-
-                    if sw1 == 0x90:  # Success
-                        uid_str = "".join(f"{x:02X}" for x in data)
-                        if uid_str != last_uid:
-                            log.info(f"Tag detected: {uid_str}")
-                            # Update HA sensor
-                            client.publish(STATE_TOPIC, uid_str,
-                                           qos=1, retain=False)
-                            # Fire tag_scanned event
-                            client.publish(TAG_EVENT_TOPIC, json.dumps(
-                                {"tag_uid": uid_str}), qos=1, retain=False)
-                            last_uid = uid_str
-                    else:
-                        log.warning(
-                            f"Failed to read UID from tag: SW1={sw1:02X}, SW2={sw2:02X}")
-
-                else:
-                    if last_uid is not None:
-                        log.info("Tag removed")
-                        client.publish(STATE_TOPIC, "", qos=1, retain=False)
-                        last_uid = None
-
-            time.sleep(0.5)
-
-        except CardConnectionException as e:
-            log.warning(f"Reader connection error: {e}")
-            last_uid = None
-            time.sleep(1)
-        except Exception as e:
-            log.error(f"Unexpected error in monitor loop: {e}")
-            time.sleep(2)
-
-# -----------------------
-# Signal Handling
-# -----------------------
+        while not stop.is_set():
+            try:
+                monitor.poll()
+                delay = POLL_INTERVAL
+            except (EstablishContextException, CardConnectionException) as exc:
+                log.warning("PC/SC error: %s", exc)
+                monitor.last_uid = None
+                delay = RETRY_INTERVAL
+            except Exception:  # pylint: disable=broad-except
+                log.exception("Unexpected error in monitor loop")
+                delay = RETRY_INTERVAL
+            stop.wait(delay)
+    finally:
+        log.info("Shutting down NFC reader...")
+        client.publish(config.availability_topic, "offline", retain=True).wait_for_publish(timeout=5)
+        client.disconnect()
+        client.loop_stop()
 
 
-def handle_shutdown(signum, frame):
-    log.info("Shutting down NFC reader...")
-    set_offline(mqtt_client)
-    mqtt_client.loop_stop()
-    mqtt_client.disconnect()
-    exit(0)
-
-
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
-
-# -----------------------
-# Main
-# -----------------------
 if __name__ == "__main__":
-    log.info("Starting NFC MQTT Bridge (event-based)")
-    mqtt_client = setup_mqtt()
-    publish_discovery(mqtt_client)
-
-    # Start NFC monitoring thread
-    threading.Thread(target=monitor_reader, args=(
-        mqtt_client,), daemon=True).start()
-
-    # Keep the main thread alive
-    while True:
-        time.sleep(1)
+    main()
