@@ -32,7 +32,21 @@ Turn a USB NFC reader into a [Home Assistant](https://www.home-assistant.io/) ta
   ```
 
 - An MQTT broker that Home Assistant uses (for example the Mosquitto add-on)
-- `pcscd` 1.9 or newer on the host (Raspberry Pi OS / Debian bullseye or later). The image uses Debian bookworm's PC/SC client, which works with both older and newer `pcscd` versions.
+- `pcscd` **2.x** on the host: Debian 13 (trixie) / Raspberry Pi OS 2025-10 or later. The container's PC/SC client
+  and the host's `pcscd` must be the same generation; for `pcscd` 1.9 hosts (Debian bullseye or bookworm) use the
+  `1` image tag.
+- If `pcscd` uses polkit (the default on trixie), allow the container's user. For example, for a container running
+  in group `fridwin_services`, add `/etc/polkit-1/rules.d/50-pcscd.rules`:
+
+  ```js
+  polkit.addRule(function (action, subject) {
+      if ((action.id == "org.debian.pcsc-lite.access_pcsc" ||
+           action.id == "org.debian.pcsc-lite.access_card") &&
+          subject.isInGroup("fridwin_services")) {
+          return polkit.Result.YES;
+      }
+  });
+  ```
 
 ## Quick start
 
@@ -126,7 +140,8 @@ For other MQTT consumers (`<id>` is `DEVICE_ID`):
 | Symptom | What to check |
 | --- | --- |
 | Log repeats *Waiting for pcscd socket* | `pcscd` is not running on the host, or `/run/pcscd` is not mounted into the container. |
-| *Failed to establish context: Service was stopped (0x8010001E)* | The container's PC/SC client and the host's `pcscd` speak incompatible protocol versions. Check `dpkg -l pcscd` on the host and open an issue with the version. |
+| *Failed to establish context: Service was stopped (0x8010001E)* | The container's PC/SC client and the host's `pcscd` are different generations. Use image `2` with `pcscd` 2.x and image `1` with `pcscd` 1.9 (`dpkg -l pcscd`). |
+| *Failed to establish context: Access denied* | `pcscd` uses polkit and does not allow the container's user; add the rule from [Requirements](#requirements). |
 | Connected, but tags are never detected | Run `pcsc_scan` on the host. If it sees the tag, check the container log with `LOG_LEVEL=DEBUG`. |
 | PC/SC access denied | Recent `pcscd` packages use polkit and may refuse users without a login session. Allow the container's UID for `org.debian.pcsc-lite.access_pcsc` and `org.debian.pcsc-lite.access_card` in a polkit rule. |
 | Reader shows as unavailable in Home Assistant | Check the MQTT host and credentials in the container log. |
