@@ -5,6 +5,7 @@ import unittest
 
 from smartcard.Exceptions import NoCardException
 
+import healthcheck
 import nfc_reader
 from nfc_reader import Config, TagMonitor, discovery_messages, format_uid, get_env_or_file
 
@@ -194,3 +195,65 @@ class MqttClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TlsTests(unittest.TestCase):
+    def test_tls_defaults_to_port_8883(self):
+        cfg = Config.from_env({"MQTT_TLS": "true"})
+        self.assertTrue(cfg.mqtt_tls)
+        self.assertEqual(cfg.mqtt_port, 8883)
+        self.assertIsNone(cfg.mqtt_tls_ca_file)
+        self.assertFalse(cfg.mqtt_tls_insecure)
+
+    def test_explicit_port_and_ca_file(self):
+        cfg = Config.from_env({"MQTT_TLS": "1", "MQTT_PORT": "9883", "MQTT_TLS_CA_FILE": "/ca.pem"})
+        self.assertEqual((cfg.mqtt_port, cfg.mqtt_tls_ca_file), (9883, "/ca.pem"))
+
+    def test_tls_off_by_default(self):
+        cfg = Config.from_env({"MQTT_TLS": "no"})
+        self.assertFalse(cfg.mqtt_tls)
+        self.assertEqual(cfg.mqtt_port, 1883)
+
+    def test_client_uses_tls_when_enabled(self):
+        calls = []
+        original_set, original_insecure = nfc_reader.mqtt.Client.tls_set, nfc_reader.mqtt.Client.tls_insecure_set
+        nfc_reader.mqtt.Client.tls_set = lambda _self, **kwargs: calls.append(("tls_set", kwargs))
+        nfc_reader.mqtt.Client.tls_insecure_set = lambda _self, value: calls.append(("insecure", value))
+        self.addCleanup(setattr, nfc_reader.mqtt.Client, "tls_set", original_set)
+        self.addCleanup(setattr, nfc_reader.mqtt.Client, "tls_insecure_set", original_insecure)
+
+        nfc_reader.create_client(config(mqtt_tls=True, mqtt_tls_ca_file="/ca.pem"))
+        self.assertEqual(calls, [("tls_set", {"ca_certs": "/ca.pem"})])
+
+        calls.clear()
+        with self.assertLogs("nfc", level="WARNING"):
+            nfc_reader.create_client(config(mqtt_tls=True, mqtt_tls_insecure=True))
+        self.assertEqual(calls, [("tls_set", {"ca_certs": None}), ("insecure", True)])
+
+    def test_client_without_tls(self):
+        client = nfc_reader.create_client(config())
+        self.assertIsNone(client._ssl_context)
+
+
+class HealthTests(unittest.TestCase):
+    def setUp(self):
+        self.path = os.path.join(tempfile.mkdtemp(), "heartbeat")
+
+    def test_missing_heartbeat_is_unhealthy(self):
+        self.assertFalse(healthcheck.is_healthy(self.path))
+
+    def test_fresh_heartbeat_is_healthy(self):
+        nfc_reader.Heartbeat(self.path).beat()
+        self.assertTrue(healthcheck.is_healthy(self.path))
+
+    def test_stale_heartbeat_is_unhealthy(self):
+        nfc_reader.Heartbeat(self.path).beat()
+        later = os.path.getmtime(self.path) + healthcheck.MAX_AGE_SECONDS + 1
+        self.assertFalse(healthcheck.is_healthy(self.path, now=later))
+
+    def test_unwritable_heartbeat_warns_once(self):
+        heartbeat = nfc_reader.Heartbeat("/nonexistent-dir/heartbeat")
+        with self.assertLogs("nfc", level="WARNING") as logs:
+            heartbeat.beat()
+            heartbeat.beat()
+        self.assertEqual(len(logs.records), 1)

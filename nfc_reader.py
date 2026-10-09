@@ -7,11 +7,14 @@ import os
 import signal
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 import paho.mqtt.client as mqtt
 from smartcard.Exceptions import CardConnectionException, NoCardException
 from smartcard.pcsc.PCSCExceptions import EstablishContextException
 from smartcard.System import readers as list_readers
+
+from healthcheck import HEARTBEAT_FILE
 
 log = logging.getLogger("nfc")
 
@@ -19,6 +22,7 @@ log = logging.getLogger("nfc")
 GET_UID_APDU = [0xFF, 0xCA, 0x00, 0x00, 0x00]
 POLL_INTERVAL = 0.5
 RETRY_INTERVAL = 2.0
+TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def get_env_or_file(name, environ=None):
@@ -33,7 +37,7 @@ def get_env_or_file(name, environ=None):
         return value
     if file_path:
         try:
-            with open(file_path, "r", encoding="utf-8") as secret_file:
+            with open(file_path, encoding="utf-8") as secret_file:
                 return secret_file.read().strip()
         except OSError as exc:
             log.error("Unable to read %s_FILE '%s': %s", name, file_path, exc)
@@ -48,18 +52,25 @@ class Config:
     mqtt_password: str | None
     device_id: str
     device_name: str
+    mqtt_tls: bool = False
+    mqtt_tls_ca_file: str | None = None
+    mqtt_tls_insecure: bool = False
 
     @classmethod
     def from_env(cls, environ=None):
         environ = os.environ if environ is None else environ
         device_id = environ.get("DEVICE_ID", "nfc_reader")
+        tls = environ.get("MQTT_TLS", "").strip().lower() in TRUE_VALUES
         return cls(
             mqtt_host=environ.get("MQTT_HOST", "localhost"),
-            mqtt_port=int(environ.get("MQTT_PORT", "1883")),
+            mqtt_port=int(environ.get("MQTT_PORT", "8883" if tls else "1883")),
             mqtt_username=environ.get("MQTT_USERNAME") or None,
             mqtt_password=get_env_or_file("MQTT_PASSWORD", environ),
             device_id=device_id,
             device_name=environ.get("DEVICE_NAME", f"NFC Reader {device_id}"),
+            mqtt_tls=tls,
+            mqtt_tls_ca_file=environ.get("MQTT_TLS_CA_FILE") or None,
+            mqtt_tls_insecure=environ.get("MQTT_TLS_INSECURE", "").strip().lower() in TRUE_VALUES,
         )
 
     @property
@@ -154,6 +165,12 @@ def create_client(config):
     client.will_set(config.availability_topic, "offline", retain=True)
     if config.mqtt_username:
         client.username_pw_set(config.mqtt_username, config.mqtt_password)
+    if config.mqtt_tls:
+        # ca_certs=None uses the system CA bundle
+        client.tls_set(ca_certs=config.mqtt_tls_ca_file)
+        if config.mqtt_tls_insecure:
+            log.warning("MQTT_TLS_INSECURE is set: the broker's certificate hostname is not verified")
+            client.tls_insecure_set(True)
 
     def on_connect(client, _userdata, _flags, reason_code, _properties):
         if reason_code.is_failure:
@@ -174,6 +191,22 @@ def create_client(config):
     return client
 
 
+class Heartbeat:
+    """Touches a file each loop so the container health check can see the bridge is alive."""
+
+    def __init__(self, path=HEARTBEAT_FILE):
+        self._path = Path(path)
+        self._warned = False
+
+    def beat(self):
+        try:
+            self._path.touch()
+        except OSError as exc:
+            if not self._warned:
+                log.warning("Cannot write heartbeat %s (health check will fail): %s", self._path, exc)
+                self._warned = True
+
+
 def main():
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -191,6 +224,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
     monitor = TagMonitor(config, lambda topic, payload: client.publish(topic, payload, qos=1))
+    heartbeat = Heartbeat()
     try:
         while not stop.is_set():
             try:
@@ -200,9 +234,10 @@ def main():
                 log.warning("PC/SC error: %s", exc)
                 monitor.last_uid = None
                 delay = RETRY_INTERVAL
-            except Exception:  # pylint: disable=broad-except
+            except Exception:
                 log.exception("Unexpected error in monitor loop")
                 delay = RETRY_INTERVAL
+            heartbeat.beat()
             stop.wait(delay)
     finally:
         log.info("Shutting down NFC reader...")

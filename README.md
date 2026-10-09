@@ -17,7 +17,9 @@ Turn a USB NFC reader into a [Home Assistant](https://www.home-assistant.io/) ta
 - **Availability** — the reader shows as unavailable when the container stops or loses its connection
 - **Works with any PC/SC reader** supported by `pcscd` (for example ACR122U)
 - **Multi-architecture image** for `amd64`, `arm64` and `arm/v7` (Raspberry Pi)
-- **Docker secrets** for the MQTT password
+- **Secure by default** — runs as non-root, works with a read-only filesystem and no Linux capabilities, supports MQTT over TLS and Docker secrets
+- **Health check** — Docker marks the container unhealthy if the bridge stops working
+- **Verifiable images** — signed build provenance and an SBOM for every image
 
 ## Requirements
 
@@ -49,6 +51,14 @@ services:
       - mqtt_password
     volumes:
       - /run/pcscd:/run/pcscd   # the host's pcscd socket
+    # Optional hardening; the bridge needs no capabilities and only writes to /tmp
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
 secrets:
   mqtt_password:
@@ -67,7 +77,10 @@ The container waits for the `pcscd` socket, connects to MQTT and registers the r
 | Variable | Description | Default |
 | --- | --- | --- |
 | `MQTT_HOST` | MQTT broker host | `localhost` |
-| `MQTT_PORT` | MQTT broker port | `1883` |
+| `MQTT_PORT` | MQTT broker port | `1883`, or `8883` with TLS |
+| `MQTT_TLS` | Connect with TLS (`true`/`false`) | `false` |
+| `MQTT_TLS_CA_FILE` | CA certificate for the broker, if it is not signed by a public CA | system CAs |
+| `MQTT_TLS_INSECURE` | Skip the certificate host name check (only for brokers reached by IP address) | `false` |
 | `MQTT_USERNAME` | MQTT username (omit for anonymous) | — |
 | `MQTT_PASSWORD` | MQTT password | — |
 | `MQTT_PASSWORD_FILE` | File containing the password, e.g. a Docker secret; ignored if `MQTT_PASSWORD` is set | — |
@@ -76,6 +89,10 @@ The container waits for the `pcscd` socket, connects to MQTT and registers the r
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING` or `ERROR` | `INFO` |
 
 Use a different `DEVICE_ID` for each reader.
+
+### MQTT over TLS
+
+Without TLS, the MQTT password and tag IDs cross the network unencrypted. If your broker has a TLS listener (the Mosquitto add-on can use your Home Assistant certificate), set `MQTT_TLS=true` and, for a private CA, mount its certificate and point `MQTT_TLS_CA_FILE` at it. The bridge refuses to connect if the broker's certificate cannot be verified.
 
 ## Home Assistant
 
@@ -111,6 +128,12 @@ For other MQTT consumers (`<id>` is `DEVICE_ID`):
 | Connected, but tags are never detected | Run `pcsc_scan` on the host. If it sees the tag, check the container log with `LOG_LEVEL=DEBUG`. |
 | PC/SC access denied | Recent `pcscd` packages use polkit and may refuse users without a login session. Allow the container's UID for `org.debian.pcsc-lite.access_pcsc` and `org.debian.pcsc-lite.access_card` in a polkit rule. |
 | Reader shows as unavailable in Home Assistant | Check the MQTT host and credentials in the container log. |
+| Container is *unhealthy* | The bridge has not completed a reader poll for 30 seconds: usually it is still waiting for `pcscd`, or it has stopped. Check the log. With `read_only: true`, `/tmp` must be writable (a `tmpfs`). |
+| *CERTIFICATE_VERIFY_FAILED* | The broker's certificate is not trusted: set `MQTT_TLS_CA_FILE`, and make sure `MQTT_HOST` matches a name in the certificate. |
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability and how to verify an image with `gh attestation verify`.
 
 ## Further reading
 

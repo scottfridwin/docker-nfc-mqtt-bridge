@@ -10,6 +10,16 @@
   "minimumReleaseAge": "3 days",
   "internalChecksFilter": "strict",
   "osvVulnerabilityAlerts": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Images pinned in workflows with a '# renovate:' comment",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+:\\s*[^:\\s]+:(?<currentValue>[^@\\s]+)(@(?<currentDigest>sha256:[a-f0-9]+))?"
+      ]
+    }
+  ],
   "assignees": [
     "scottfridwin"
   ]
