@@ -1,72 +1,121 @@
 # NFC → MQTT Bridge
 
-Reads NFC tags using PC/SC and publishes them to MQTT.
-Designed for Raspberry Pi and Docker.
+[![Build](https://img.shields.io/github/actions/workflow/status/scottfridwin/docker-nfc-mqtt-bridge/build.yml?branch=main&label=build)](https://github.com/scottfridwin/docker-nfc-mqtt-bridge/actions/workflows/build.yml)
+[![Release](https://img.shields.io/github/v/release/scottfridwin/docker-nfc-mqtt-bridge)](https://github.com/scottfridwin/docker-nfc-mqtt-bridge/releases/latest)
+[![Image](https://img.shields.io/badge/image-ghcr.io-blue?logo=docker)](https://github.com/scottfridwin/docker-nfc-mqtt-bridge/pkgs/container/nfc-mqtt-bridge)
+[![License](https://img.shields.io/github/license/scottfridwin/docker-nfc-mqtt-bridge)](LICENSE)
 
-Disclaimer: This was (almost) entirely by AI.
+Turn a USB NFC reader into a [Home Assistant](https://www.home-assistant.io/) tag scanner. The container reads tag UIDs through the host's PC/SC daemon (`pcscd`) and publishes them to MQTT, with Home Assistant discovery so the reader shows up on its own.
 
----
-## Requirements (Host)
-Install on Raspberry Pi / Linux host:
-```bash
-sudo apt install pcscd pcsc-tools
-sudo systemctl enable --now pcscd
+> [!NOTE]
+> **AI disclosure:** This project is built and maintained with substantial help from AI coding assistants (GitHub Copilot). AI is used to write and modify the code, tests, documentation and CI configuration, and to manage the repository. Dependency updates are merged and released automatically, without human review, when the automated tests pass. Review the code and test it in your own environment before relying on it.
+
+## Features
+
+- **Home Assistant tag scanner** — scans appear under **Settings → Tags** and can trigger automations
+- **Tag UID sensor** — shows the tag currently on the reader, cleared when it is removed
+- **Availability** — the reader shows as unavailable when the container stops or loses its connection
+- **Works with any PC/SC reader** supported by `pcscd` (for example ACR122U)
+- **Multi-architecture image** for `amd64`, `arm64` and `arm/v7` (Raspberry Pi)
+- **Docker secrets** for the MQTT password
+
+## Requirements
+
+- A Linux host with a USB NFC reader and `pcscd` running:
+
+  ```bash
+  sudo apt install pcscd pcsc-tools
+  sudo systemctl enable --now pcscd
+  pcsc_scan   # place a tag on the reader to check it works
+  ```
+
+- An MQTT broker that Home Assistant uses (for example the Mosquitto add-on)
+
+## Quick start
+
+```yaml
+services:
+  nfc-mqtt-bridge:
+    image: ghcr.io/scottfridwin/nfc-mqtt-bridge:1
+    container_name: nfc-mqtt-bridge
+    restart: unless-stopped
+    environment:
+      MQTT_HOST: homeassistant.local
+      MQTT_USERNAME: nfc
+      MQTT_PASSWORD_FILE: /run/secrets/mqtt_password
+      DEVICE_ID: nfc_reader_hall
+      DEVICE_NAME: Hall NFC Reader
+    secrets:
+      - mqtt_password
+    volumes:
+      - /run/pcscd:/run/pcscd   # the host's pcscd socket
+
+secrets:
+  mqtt_password:
+    file: ./mqtt_password.txt
 ```
-Verify:
+
 ```bash
-pcsc_scan
-```
----
-## Build & Run
-```bash
-docker compose build
+printf '%s' 'your-mqtt-password' > mqtt_password.txt && chmod 600 mqtt_password.txt
 docker compose up -d
 ```
 
-## MQTT Password Configuration
-The bridge supports either:
-- `MQTT_PASSWORD`
-- `MQTT_PASSWORD_FILE`
+The container waits for the `pcscd` socket, connects to MQTT and registers the reader with Home Assistant.
 
-If both are set, `MQTT_PASSWORD` wins.
+## Configuration
 
-### Docker Secrets (recommended)
-Create a local secret file:
-```bash
-mkdir -p .secrets
-printf '%s' 'your-mqtt-password' > .secrets/mqtt_password.txt
-chmod 600 .secrets/mqtt_password.txt
-```
+| Variable | Description | Default |
+| --- | --- | --- |
+| `MQTT_HOST` | MQTT broker host | `localhost` |
+| `MQTT_PORT` | MQTT broker port | `1883` |
+| `MQTT_USERNAME` | MQTT username (omit for anonymous) | — |
+| `MQTT_PASSWORD` | MQTT password | — |
+| `MQTT_PASSWORD_FILE` | File containing the password, e.g. a Docker secret; ignored if `MQTT_PASSWORD` is set | — |
+| `DEVICE_ID` | Unique ID for this reader; used in topics and Home Assistant IDs (letters, digits, `_`, `-`) | `nfc_reader` |
+| `DEVICE_NAME` | Display name in Home Assistant | `NFC Reader <DEVICE_ID>` |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING` or `ERROR` | `INFO` |
 
-The included compose file already maps this secret and sets:
+Use a different `DEVICE_ID` for each reader.
+
+## Home Assistant
+
+The reader appears as a device with a **Tag UID** sensor and a tag scanner. Each scanned tag is added under **Settings → Tags**, where you can name it and create automations, or trigger on it directly:
+
 ```yaml
-MQTT_PASSWORD_FILE: /run/secrets/mqtt_password
+automation:
+  - alias: Play music when the speaker tag is scanned
+    triggers:
+      - trigger: tag
+        tag_id: 04A1B2C3D4E5F6
+    actions:
+      - action: media_player.media_play
+        target:
+          entity_id: media_player.living_room
 ```
 
-### Direct Environment Variable
-If you do not want to use Docker secrets, set:
-```yaml
-MQTT_PASSWORD: your-mqtt-password
-```
+### MQTT topics
 
----
-## Home Assistant Example
-```yaml
-mqtt:
-sensor:
-- name: "NFC Tag"
-state_topic: "homeassistant/nfc/tag"
-```
----
-## Supported Architectures
-Multi-arch builds supported:
-- amd64
-- arm64
-- arm/v8
-Buildx example:
-```bash
-docker buildx build \
---platform linux/amd64,linux/arm64,linux/arm/v8 \
--t yourrepo/nfc-mqtt . \
---push
-```
+For other MQTT consumers (`<id>` is `DEVICE_ID`):
+
+| Topic | Payload |
+| --- | --- |
+| `homeassistant/event/<id>/tag_scanned` | `{"tag_uid": "04A1B2C3D4E5F6"}` when a tag is placed on the reader |
+| `homeassistant/sensor/<id>/uid/state` | The UID while a tag is present, empty when it is removed |
+| `homeassistant/sensor/<id>/availability` | `online` / `offline` (retained) |
+
+## Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Log repeats *Waiting for pcscd socket* | `pcscd` is not running on the host, or `/run/pcscd` is not mounted into the container. |
+| Connected, but tags are never detected | Run `pcsc_scan` on the host. If it sees the tag, check the container log with `LOG_LEVEL=DEBUG`. |
+| PC/SC access denied | Recent `pcscd` packages use polkit and may refuse users without a login session. Allow the container's UID for `org.debian.pcsc-lite.access_pcsc` and `org.debian.pcsc-lite.access_card` in a polkit rule. |
+| Reader shows as unavailable in Home Assistant | Check the MQTT host and credentials in the container log. |
+
+## Further reading
+
+- [Development](docs/development.md)
+
+## License
+
+[GPL-3.0](LICENSE)
