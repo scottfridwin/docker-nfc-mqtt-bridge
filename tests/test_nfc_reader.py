@@ -3,11 +3,13 @@ import os
 import tempfile
 import unittest
 
-from smartcard.Exceptions import NoCardException
+from smartcard.Exceptions import CardConnectionException, NoCardException
 
 import healthcheck
 import nfc_reader
 from nfc_reader import Config, TagMonitor, discovery_messages, format_uid, get_env_or_file
+
+UNPOWERED = "unpowered"
 
 
 class FakeConnection:
@@ -18,6 +20,8 @@ class FakeConnection:
     def connect(self):
         if self._card is None:
             raise NoCardException("no card", 0)
+        if self._card == UNPOWERED:
+            raise CardConnectionException("Card is unpowered. (0x80100067)")
         self.connected = True
 
     def transmit(self, apdu):
@@ -169,6 +173,56 @@ class TagMonitorTests(unittest.TestCase):
     def test_no_readers_is_quiet(self):
         monitor = TagMonitor(config(), lambda *_: self.fail("should not publish"), lambda: [])
         monitor.poll()
+
+
+class MultiSlotReaderTests(unittest.TestCase):
+    """Readers like the ACR1552 show up as two PC/SC readers: the antenna (PICC) and an empty SAM socket."""
+
+    def setUp(self):
+        self.published = []
+        self.picc = FakeReader()
+        self.sam = FakeReader()
+        self.monitor = TagMonitor(
+            config(), lambda topic, payload: self.published.append((topic, payload)), lambda: [self.picc, self.sam]
+        )
+
+    def scans(self):
+        return [payload for topic, payload in self.published if topic.endswith("/tag_scanned")]
+
+    def test_tag_held_on_antenna_is_scanned_once_with_empty_sam(self):
+        self.picc.card = ([0x04, 0xA1], 0x90, 0x00)
+        for _ in range(5):
+            self.monitor.poll()
+        self.assertEqual(self.scans(), [json.dumps({"tag_uid": "04A1"})])
+
+    def test_tag_held_on_antenna_is_scanned_once_with_unpowered_sam(self):
+        self.picc.card = ([0x04, 0xA1], 0x90, 0x00)
+        self.sam.card = UNPOWERED
+        for _ in range(5):
+            self.monitor.poll()
+        self.assertEqual(self.scans(), [json.dumps({"tag_uid": "04A1"})])
+
+    def test_unpowered_slot_alone_counts_as_no_tag(self):
+        self.sam.card = UNPOWERED
+        self.monitor.poll()
+        self.assertEqual(self.published, [])
+
+    def test_removal_is_detected_across_slots(self):
+        self.picc.card = ([0x04], 0x90, 0x00)
+        self.sam.card = UNPOWERED
+        self.monitor.poll()
+        self.picc.card = None
+        self.monitor.poll()
+        self.assertEqual(self.published[-1], ("homeassistant/sensor/reader1/uid/state", ""))
+
+    def test_unreadable_card_keeps_current_tag(self):
+        self.picc.card = ([0x04], 0x90, 0x00)
+        self.monitor.poll()
+        self.picc.card = ([], 0x63, 0x00)
+        with self.assertLogs("nfc", level="WARNING"):
+            self.monitor.poll()
+        self.assertEqual(self.monitor.last_uid, "04")
+        self.assertEqual(len(self.published), 2)
 
 
 class MqttClientTests(unittest.TestCase):
