@@ -127,22 +127,34 @@ class TagMonitor:
         self.last_uid = None
 
     def poll(self):
-        for reader in self._readers():
-            connection = reader.createConnection()
-            try:
-                connection.connect()
-            except NoCardException:
-                self._tag_removed()
-                continue
-            try:
-                data, sw1, sw2 = connection.transmit(GET_UID_APDU)
-            finally:
-                connection.disconnect()
+        # Readers such as the ACR1552 expose several slots (antenna + SAM socket); decide across all of them.
+        uids = [self._read_uid(reader) for reader in self._readers()]
+        uid = next((uid for uid in uids if uid), None)
+        if uid:
+            self._tag_present(uid)
+        elif "" not in uids:
+            self._tag_removed()
 
-            if sw1 != 0x90:
-                log.warning("Failed to read UID from tag: SW1=%02X, SW2=%02X", sw1, sw2)
-                continue
-            self._tag_present(format_uid(data))
+    def _read_uid(self, reader):
+        """Return the tag's UID, None if the slot has no card, or "" if a card is there but unreadable."""
+        connection = reader.createConnection()
+        try:
+            connection.connect()
+        except NoCardException, CardConnectionException:
+            # Empty slot, or a slot without a powered card (an empty SAM socket raises "Card is unpowered")
+            return None
+        try:
+            data, sw1, sw2 = connection.transmit(GET_UID_APDU)
+        except CardConnectionException as exc:
+            log.debug("Tag left %s while reading: %s", reader, exc)
+            return ""
+        finally:
+            connection.disconnect()
+
+        if sw1 != 0x90:
+            log.warning("Failed to read UID from tag: SW1=%02X, SW2=%02X", sw1, sw2)
+            return ""
+        return format_uid(data)
 
     def _tag_present(self, uid):
         if uid == self.last_uid:
