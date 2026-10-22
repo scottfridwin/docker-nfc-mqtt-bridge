@@ -1,6 +1,6 @@
 # The PC/SC client must match the host's pcscd generation: trixie (2.x) here; release 1.x is bookworm (1.9)
 # Build stage: compile pyscard (needs swig and the PC/SC headers) into wheels
-FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS build
+FROM python:3.14-slim@sha256:0514bc76712d64f8bb48adcb95b1ab0d88c69fee95d62fe4c18ee948bee9b1e1 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc libc6-dev libpcsclite-dev swig \
     && rm -rf /var/lib/apt/lists/*
@@ -8,7 +8,7 @@ COPY requirements.txt /tmp/
 RUN pip wheel --no-cache-dir --wheel-dir /wheels -r /tmp/requirements.txt
 
 # Runtime stage: only the PC/SC client library and the wheels
-FROM python:3.14-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS runtime
+FROM python:3.14-slim@sha256:0514bc76712d64f8bb48adcb95b1ab0d88c69fee95d62fe4c18ee948bee9b1e1 AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libpcsclite1 \
     && rm -rf /var/lib/apt/lists/*
